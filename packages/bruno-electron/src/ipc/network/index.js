@@ -37,6 +37,7 @@ const {
   transformPasswordCredentialsRequest
 } = require('./oauth2-helper');
 const Oauth2Store = require('../../store/oauth2');
+const iconv = require('iconv-lite');
 
 // override the default escape function to prevent escaping
 Mustache.escape = function (value) {
@@ -123,31 +124,36 @@ const configureRequest = async (
 
   // client certificate config
   const clientCertConfig = get(brunoConfig, 'clientCertificates.certs', []);
+
   for (let clientCert of clientCertConfig) {
-    const domain = interpolateString(clientCert.domain, interpolationOptions);
-
-    let certFilePath = interpolateString(clientCert.certFilePath, interpolationOptions);
-    certFilePath = path.isAbsolute(certFilePath) ? certFilePath : path.join(collectionPath, certFilePath);
-
-    let keyFilePath = interpolateString(clientCert.keyFilePath, interpolationOptions);
-    keyFilePath = path.isAbsolute(keyFilePath) ? keyFilePath : path.join(collectionPath, keyFilePath);
-
-    if (domain && certFilePath && keyFilePath) {
+    const domain = interpolateString(clientCert?.domain, interpolationOptions);
+    const type = clientCert?.type || 'cert';
+    if (domain) {
       const hostRegex = '^https:\\/\\/' + domain.replaceAll('.', '\\.').replaceAll('*', '.*');
-
       if (request.url.match(hostRegex)) {
-        try {
-          httpsAgentRequestFields['cert'] = fs.readFileSync(certFilePath);
-        } catch (err) {
-          console.log('Error reading cert file', err);
-        }
+        if (type === 'cert') {
+          try {
+            let certFilePath = interpolateString(clientCert?.certFilePath, interpolationOptions);
+            certFilePath = path.isAbsolute(certFilePath) ? certFilePath : path.join(collectionPath, certFilePath);
+            let keyFilePath = interpolateString(clientCert?.keyFilePath, interpolationOptions);
+            keyFilePath = path.isAbsolute(keyFilePath) ? keyFilePath : path.join(collectionPath, keyFilePath);
 
-        try {
-          httpsAgentRequestFields['key'] = fs.readFileSync(keyFilePath);
-        } catch (err) {
-          console.log('Error reading key file', err);
+            httpsAgentRequestFields['cert'] = fs.readFileSync(certFilePath);
+            httpsAgentRequestFields['key'] = fs.readFileSync(keyFilePath);
+          } catch (err) {
+            console.error('Error reading cert/key file', err);
+            throw new Error('Error reading cert/key file' + err);
+          }
+        } else if (type === 'pfx') {
+          try {
+            let pfxFilePath = interpolateString(clientCert?.pfxFilePath, interpolationOptions);
+            pfxFilePath = path.isAbsolute(pfxFilePath) ? pfxFilePath : path.join(collectionPath, pfxFilePath);
+            httpsAgentRequestFields['pfx'] = fs.readFileSync(pfxFilePath);
+          } catch (err) {
+            console.error('Error reading pfx file', err);
+            throw new Error('Error reading pfx file' + err);
+          }
         }
-
         httpsAgentRequestFields['passphrase'] = interpolateString(clientCert.passphrase, interpolationOptions);
         break;
       }
@@ -254,18 +260,32 @@ const configureRequest = async (
       request.headers['cookie'] = cookieString;
     }
   }
+
+  // Remove pathParams, already in URL (Issue #2439)
+  delete request.pathParams;
+
   return axiosInstance;
 };
 
 const parseDataFromResponse = (response) => {
-  const dataBuffer = Buffer.from(response.data);
   // Parse the charset from content type: https://stackoverflow.com/a/33192813
-  const charset = /charset=([^()<>@,;:"/[\]?.=\s]*)/i.exec(response.headers['Content-Type'] || '');
+  const charsetMatch = /charset=([^()<>@,;:"/[\]?.=\s]*)/i.exec(response.headers['content-type'] || '');
+  // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/RegExp/exec#using_exec_with_regexp_literals
+  const charsetValue = charsetMatch?.[1];
+  const dataBuffer = Buffer.from(response.data);
   // Overwrite the original data for backwards compatibility
-  let data = dataBuffer.toString(charset || 'utf-8');
+  let data;
+  if (iconv.encodingExists(charsetValue)) {
+    data = iconv.decode(dataBuffer, charsetValue);
+  } else {
+    data = iconv.decode(dataBuffer, 'utf-8');
+  }
   // Try to parse response to JSON, this can quietly fail
   try {
-    data = JSON.parse(response.data);
+    // Filter out ZWNBSP character
+    // https://gist.github.com/antic183/619f42b559b78028d1fe9e7ae8a1352d
+    data = data.replace(/^\uFEFF/, '');
+    data = JSON.parse(data);
   } catch {}
 
   return { data, dataBuffer };
@@ -389,6 +409,10 @@ const registerNetworkIpc = (mainWindow) => {
           requestUid,
           collectionUid
         });
+      }
+
+      if (result?.error) {
+        mainWindow.webContents.send('main:display-error', result.error);
       }
     }
 
@@ -565,7 +589,7 @@ const registerNetworkIpc = (mainWindow) => {
           response,
           envVars,
           collectionVariables,
-          collectionPath
+          processEnvVars
         );
 
         mainWindow.webContents.send('main:run-request-event', {
@@ -725,11 +749,11 @@ const registerNetworkIpc = (mainWindow) => {
     });
   });
 
-  ipcMain.handle('fetch-gql-schema', async (event, endpoint, environment, request, collection) => {
+  ipcMain.handle('fetch-gql-schema', async (event, endpoint, environment, _request, collection) => {
     try {
       const envVars = getEnvVars(environment);
       const collectionRoot = get(collection, 'root', {});
-      const preparedRequest = prepareGqlIntrospectionRequest(endpoint, envVars, request, collectionRoot);
+      const request = prepareGqlIntrospectionRequest(endpoint, envVars, _request, collectionRoot);
 
       request.timeout = preferencesUtil.getRequestTimeout();
 
@@ -759,16 +783,16 @@ const registerNetworkIpc = (mainWindow) => {
         scriptingConfig
       );
 
-      interpolateVars(preparedRequest, envVars, collection.collectionVariables, processEnvVars);
+      interpolateVars(request, envVars, collection.collectionVariables, processEnvVars);
       const axiosInstance = await configureRequest(
         collection.uid,
-        preparedRequest,
+        request,
         envVars,
         collection.collectionVariables,
         processEnvVars,
         collectionPath
       );
-      const response = await axiosInstance(preparedRequest);
+      const response = await axiosInstance(request);
 
       await runPostResponse(
         request,
@@ -1004,7 +1028,7 @@ const registerNetworkIpc = (mainWindow) => {
                 response,
                 envVars,
                 collectionVariables,
-                collectionPath
+                processEnvVars
               );
 
               mainWindow.webContents.send('main:run-folder-event', {
